@@ -28,6 +28,11 @@ namespace polybench
 #define j_wg_sz (32)
 #define i_wg_sz (work_group_size / j_wg_sz)
 
+  //
+  // Tile size for SLM tiling optimization (Base_SYCL)
+  //
+#define TILE_SIZE (16)
+
 
 template < size_t work_group_size >
 void POLYBENCH_GEMM::runSyclVariantImpl(VariantID vid)
@@ -43,30 +48,61 @@ void POLYBENCH_GEMM::runSyclVariantImpl(VariantID vid)
 
   if ( vid == Base_SYCL ) {
 
-    sycl::range<3> global_dim(1,
-                              i_wg_sz * RAJA_DIVIDE_CEILING_INT(ni, i_wg_sz),
-                              j_wg_sz * RAJA_DIVIDE_CEILING_INT(nj, j_wg_sz));
+    // SLM tiling optimization: cooperative tile loads reduce global memory
+    // traffic by ~TILE_SIZE x. Each tile iteration loads TILE_SIZE x TILE_SIZE
+    // blocks of A and B into shared local memory, then computes partial
+    // products from SLM. Alpha is factored out of the inner loop.
 
-    sycl::range<3> wkgroup_dim(1, i_wg_sz, j_wg_sz); 
+    sycl::range<3> global_dim(1,
+                              TILE_SIZE * RAJA_DIVIDE_CEILING_INT(ni, TILE_SIZE),
+                              TILE_SIZE * RAJA_DIVIDE_CEILING_INT(nj, TILE_SIZE));
+
+    sycl::range<3> wkgroup_dim(1, TILE_SIZE, TILE_SIZE);
 
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
       qu->submit([&] (sycl::handler& h) {
+
+        sycl::local_accessor<Real_type, 1> s_A(sycl::range<1>(TILE_SIZE * TILE_SIZE), h);
+        sycl::local_accessor<Real_type, 1> s_B(sycl::range<1>(TILE_SIZE * TILE_SIZE), h);
+
         h.parallel_for(sycl::nd_range<3>( global_dim, wkgroup_dim),
                        [=] (sycl::nd_item<3> item) {
 
-          Index_type i = item.get_global_id(1);
-          Index_type j = item.get_global_id(2);
+          Index_type ty = item.get_local_id(1);
+          Index_type tx = item.get_local_id(2);
+          Index_type i = item.get_group(1) * TILE_SIZE + ty;
+          Index_type j = item.get_group(2) * TILE_SIZE + tx;
 
-          if (i < ni && j < nj) {
-            POLYBENCH_GEMM_BODY1;
-            POLYBENCH_GEMM_BODY2;
-            for (Index_type k = 0; k < nk; ++k) {
-              POLYBENCH_GEMM_BODY3;
+          Real_type dot = 0.0;
+          Index_type ntiles = (nk + TILE_SIZE - 1) / TILE_SIZE;
+
+          for (Index_type t = 0; t < ntiles; t++) {
+            // Cooperative load of A tile: A[i][t*TILE_SIZE + tx]
+            Index_type ak = t * TILE_SIZE + tx;
+            s_A[ty * TILE_SIZE + tx] = (i < ni && ak < nk)
+                ? A[ak + i * nk] : 0.0;
+
+            // Cooperative load of B tile: B[t*TILE_SIZE + ty][j]
+            Index_type bk = t * TILE_SIZE + ty;
+            s_B[ty * TILE_SIZE + tx] = (bk < nk && j < nj)
+                ? B[j + bk * nj] : 0.0;
+
+            item.barrier(sycl::access::fence_space::local_space);
+
+            // Accumulate partial products from SLM
+            for (Index_type kk = 0; kk < TILE_SIZE; kk++) {
+              dot += s_A[ty * TILE_SIZE + kk] * s_B[kk * TILE_SIZE + tx];
             }
-            POLYBENCH_GEMM_BODY4;
+
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+
+          // Write result: C = alpha * dot
+          if (i < ni && j < nj) {
+            C[j + i * nj] = alpha * dot;
           }
 
         });
