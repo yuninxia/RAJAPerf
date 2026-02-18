@@ -44,52 +44,102 @@ void POLYBENCH_2MM::runSyclVariantImpl(VariantID vid)
 
   if ( vid == Base_SYCL ) {
 
+    // SLM tiling optimization: cooperative tile loads reduce global memory
+    // traffic by ~TILE x per GEMM.  Each tile iteration loads TILE x TILE
+    // blocks of both input matrices into shared local memory, synchronises,
+    // then computes TILE FMAs per thread from SLM.
+    constexpr Index_type TILE = 16;
+
     sycl::range<3> global_dim1(1,
-                               out_wg_sz * RAJA_DIVIDE_CEILING_INT(ni, out_wg_sz),
-                               in_wg_sz * RAJA_DIVIDE_CEILING_INT(nj, in_wg_sz));
+                               TILE * RAJA_DIVIDE_CEILING_INT(ni, TILE),
+                               TILE * RAJA_DIVIDE_CEILING_INT(nj, TILE));
 
     sycl::range<3> global_dim2(1,
-                               out_wg_sz * RAJA_DIVIDE_CEILING_INT(ni, out_wg_sz),
-                               in_wg_sz * RAJA_DIVIDE_CEILING_INT(nl, in_wg_sz));
+                               TILE * RAJA_DIVIDE_CEILING_INT(ni, TILE),
+                               TILE * RAJA_DIVIDE_CEILING_INT(nl, TILE));
 
-    sycl::range<3> wkgroup_dim(1, out_wg_sz, in_wg_sz);
+    sycl::range<3> wkgroup_dim(1, TILE, TILE);
 
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
+      // Kernel 1 (tiled): tmp[ni x nj] = alpha * A[ni x nk] * B[nk x nj]
       qu->submit([&] (sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<3>( global_dim1, wkgroup_dim), 
+        sycl::local_accessor<Real_type, 1> s_A(sycl::range<1>(TILE * TILE), h);
+        sycl::local_accessor<Real_type, 1> s_B(sycl::range<1>(TILE * TILE), h);
+
+        h.parallel_for(sycl::nd_range<3>( global_dim1, wkgroup_dim),
                        [=] (sycl::nd_item<3> item) {
 
-          Index_type i = item.get_global_id(1); 
-          Index_type j = item.get_global_id(2); 
+          Index_type ty  = item.get_local_id(1);
+          Index_type tx  = item.get_local_id(2);
+          Index_type row = item.get_group(1) * TILE + ty;  // i
+          Index_type col = item.get_group(2) * TILE + tx;  // j
 
-          if (i < ni && j < nj) {
-            POLYBENCH_2MM_BODY1;
-            for (Index_type k=0; k < nk; ++k) {
-              POLYBENCH_2MM_BODY2;
-            }
-            POLYBENCH_2MM_BODY3;
+          Real_type dot = 0.0;
+          Index_type ntiles = (nk + TILE - 1) / TILE;
+
+          for (Index_type t = 0; t < ntiles; t++) {
+            Index_type ak = t * TILE + tx;
+            s_A[ty * TILE + tx] = (row < ni && ak < nk)
+                ? A[ak + row * nk] : 0.0;
+
+            Index_type bk = t * TILE + ty;
+            s_B[ty * TILE + tx] = (bk < nk && col < nj)
+                ? B[col + bk * nj] : 0.0;
+
+            item.barrier(sycl::access::fence_space::local_space);
+
+            #pragma unroll
+            for (Index_type kk = 0; kk < TILE; kk++)
+              dot += s_A[ty * TILE + kk] * s_B[kk * TILE + tx];
+
+            item.barrier(sycl::access::fence_space::local_space);
           }
+
+          if (row < ni && col < nj)
+            tmp[col + row * nj] = alpha * dot;
 
         });
       });
 
+      // Kernel 2 (tiled): D[ni x nl] = beta + tmp[ni x nj] * C[nj x nl]
       qu->submit([&] (sycl::handler& h) {
+        sycl::local_accessor<Real_type, 1> s_tmp(sycl::range<1>(TILE * TILE), h);
+        sycl::local_accessor<Real_type, 1> s_C(sycl::range<1>(TILE * TILE), h);
+
         h.parallel_for(sycl::nd_range<3>( global_dim2, wkgroup_dim),
                        [=] (sycl::nd_item<3> item) {
 
-         Index_type i = item.get_global_id(1); 
-         Index_type l = item.get_global_id(2);
+          Index_type ty  = item.get_local_id(1);
+          Index_type tx  = item.get_local_id(2);
+          Index_type row = item.get_group(1) * TILE + ty;  // i
+          Index_type col = item.get_group(2) * TILE + tx;  // l
 
-         if (i < ni && l < nl) {        
-           POLYBENCH_2MM_BODY4;
-           for (Index_type j=0; j < nj; ++j) {
-              POLYBENCH_2MM_BODY5;
-           }
-           POLYBENCH_2MM_BODY6;
-         }
+          Real_type dot = 0.0;
+          Index_type ntiles = (nj + TILE - 1) / TILE;
+
+          for (Index_type t = 0; t < ntiles; t++) {
+            Index_type tj = t * TILE + tx;
+            s_tmp[ty * TILE + tx] = (row < ni && tj < nj)
+                ? tmp[tj + row * nj] : 0.0;
+
+            Index_type cj = t * TILE + ty;
+            s_C[ty * TILE + tx] = (cj < nj && col < nl)
+                ? C[col + cj * nl] : 0.0;
+
+            item.barrier(sycl::access::fence_space::local_space);
+
+            #pragma unroll
+            for (Index_type jj = 0; jj < TILE; jj++)
+              dot += s_tmp[ty * TILE + jj] * s_C[jj * TILE + tx];
+
+            item.barrier(sycl::access::fence_space::local_space);
+          }
+
+          if (row < ni && col < nl)
+            D[col + row * nl] = beta + dot;
 
         });
       });
