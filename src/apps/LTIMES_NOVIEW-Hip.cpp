@@ -66,7 +66,9 @@ __global__ void ltimes_noview(Real_ptr phidat, Real_ptr elldat, Real_ptr psidat,
 // causes cache line misses per warp per d-iteration.
 template < size_t m_block_size, size_t g_block_size, size_t z_block_size >
 __launch_bounds__(m_block_size*g_block_size*z_block_size)
-__global__ void ltimes_noview_opt(Real_ptr phidat, Real_ptr elldat, Real_ptr psidat,
+__global__ void ltimes_noview_opt(Real_type* __restrict__ phidat,
+                                  const Real_type* __restrict__ elldat,
+                                  const Real_type* __restrict__ psidat,
                                   Index_type num_d,
                                   Index_type num_m, Index_type num_g, Index_type num_z)
 {
@@ -144,11 +146,14 @@ void LTIMES_NOVIEW::runHipVariantImpl(VariantID vid)
       LTIMES_NOVIEW_THREADS_PER_BLOCK_HIP;
       LTIMES_NOVIEW_NBLOCKS_HIP;
 
+      const Real_type* celldat = elldat;
+      const Real_type* cpsidat = psidat;
+
       RPlaunchHipKernel(
         (ltimes_noview_opt<LTIMES_NOVIEW_THREADS_PER_BLOCK_TEMPLATE_PARAMS_HIP>),
         nblocks, nthreads_per_block,
         shmem, res.get_stream(),
-        phidat, elldat, psidat,
+        phidat, celldat, cpsidat,
         num_d, num_m, num_g, num_z );
 
     }

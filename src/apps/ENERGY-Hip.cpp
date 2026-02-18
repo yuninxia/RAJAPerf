@@ -32,13 +32,21 @@ namespace apps
 // Achieved 2.33x on AMD MI300A.
 template < size_t block_size >
 __launch_bounds__(block_size)
-__global__ void energy_fused(Real_ptr e_new, Real_ptr q_new,
-                             Real_ptr e_old, Real_ptr delvc,
-                             Real_ptr p_old, Real_ptr q_old, Real_ptr work,
-                             Real_ptr compHalfStep, Real_ptr pHalfStep,
-                             Real_ptr bvc, Real_ptr pbvc,
-                             Real_ptr ql_old, Real_ptr qq_old,
-                             Real_ptr vnewc, Real_ptr p_new,
+__global__ void energy_fused(Real_type* __restrict__ e_new,
+                             Real_type* __restrict__ q_new,
+                             const Real_type* __restrict__ e_old,
+                             const Real_type* __restrict__ delvc,
+                             const Real_type* __restrict__ p_old,
+                             const Real_type* __restrict__ q_old,
+                             const Real_type* __restrict__ work,
+                             const Real_type* __restrict__ compHalfStep,
+                             const Real_type* __restrict__ pHalfStep,
+                             const Real_type* __restrict__ bvc,
+                             const Real_type* __restrict__ pbvc,
+                             const Real_type* __restrict__ ql_old,
+                             const Real_type* __restrict__ qq_old,
+                             const Real_type* __restrict__ vnewc,
+                             const Real_type* __restrict__ p_new,
                              Real_type rho0, Real_type e_cut,
                              Real_type emin, Real_type q_cut,
                              Index_type iend)
@@ -165,16 +173,30 @@ void ENERGY::runHipVariantImpl(VariantID vid)
       const size_t grid_size = RAJA_DIVIDE_CEILING_INT(iend, block_size);
       constexpr size_t shmem = 0;
 
+      const Real_type* ce_old = e_old;
+      const Real_type* cdelvc = delvc;
+      const Real_type* cp_old = p_old;
+      const Real_type* cq_old = q_old;
+      const Real_type* cwork = work;
+      const Real_type* ccompHalfStep = compHalfStep;
+      const Real_type* cpHalfStep = pHalfStep;
+      const Real_type* cbvc = bvc;
+      const Real_type* cpbvc = pbvc;
+      const Real_type* cql_old = ql_old;
+      const Real_type* cqq_old = qq_old;
+      const Real_type* cvnewc = vnewc;
+      const Real_type* cp_new = p_new;
+
       RPlaunchHipKernel( (energy_fused<block_size>),
                          grid_size, block_size,
                          shmem, res.get_stream(),
                          e_new, q_new,
-                         e_old, delvc,
-                         p_old, q_old, work,
-                         compHalfStep, pHalfStep,
-                         bvc, pbvc,
-                         ql_old, qq_old,
-                         vnewc, p_new,
+                         ce_old, cdelvc,
+                         cp_old, cq_old, cwork,
+                         ccompHalfStep, cpHalfStep,
+                         cbvc, cpbvc,
+                         cql_old, cqq_old,
+                         cvnewc, cp_new,
                          rho0, e_cut, emin, q_cut,
                          iend );
 

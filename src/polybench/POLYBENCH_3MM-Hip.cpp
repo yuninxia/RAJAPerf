@@ -154,9 +154,9 @@ __global__ void poly_3mm_3_lam(Index_type ni, Index_type nl,
 // Kernel 1 (tiled): E[ni x nj] = A[ni x nk] * B[nk x nj]
 template < int tile >
 __launch_bounds__(tile * tile)
-__global__ void poly_3mm_1_tiled(Real_ptr __restrict__ E,
-                                 Real_ptr __restrict__ A,
-                                 Real_ptr __restrict__ B,
+__global__ void poly_3mm_1_tiled(Real_type* __restrict__ E,
+                                 const Real_type* __restrict__ A,
+                                 const Real_type* __restrict__ B,
                                  Index_type ni, Index_type nj, Index_type nk)
 {
   __shared__ Real_type s_A[tile][tile];
@@ -193,9 +193,9 @@ __global__ void poly_3mm_1_tiled(Real_ptr __restrict__ E,
 // Kernel 2 (tiled): F[nj x nl] = C[nj x nm] * D[nm x nl]
 template < int tile >
 __launch_bounds__(tile * tile)
-__global__ void poly_3mm_2_tiled(Real_ptr __restrict__ F,
-                                 Real_ptr __restrict__ C,
-                                 Real_ptr __restrict__ D,
+__global__ void poly_3mm_2_tiled(Real_type* __restrict__ F,
+                                 const Real_type* __restrict__ C,
+                                 const Real_type* __restrict__ D,
                                  Index_type nj, Index_type nl, Index_type nm)
 {
   __shared__ Real_type s_C[tile][tile];
@@ -232,9 +232,9 @@ __global__ void poly_3mm_2_tiled(Real_ptr __restrict__ F,
 // Kernel 3 (tiled): G[ni x nl] = E[ni x nj] * F[nj x nl]
 template < int tile >
 __launch_bounds__(tile * tile)
-__global__ void poly_3mm_3_tiled(Real_ptr __restrict__ G,
-                                 Real_ptr __restrict__ E,
-                                 Real_ptr __restrict__ F,
+__global__ void poly_3mm_3_tiled(Real_type* __restrict__ G,
+                                 const Real_type* __restrict__ E,
+                                 const Real_type* __restrict__ F,
                                  Index_type ni, Index_type nl, Index_type nj)
 {
   __shared__ Real_type s_E[tile][tile];
@@ -298,11 +298,14 @@ void POLYBENCH_3MM::runHipVariantImpl(VariantID vid)
                     static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, TILE_SZ)),
                     static_cast<size_t>(1));
 
+      const Real_type* cA = A;
+      const Real_type* cB = B;
+
       RPlaunchHipKernel(
         (poly_3mm_1_tiled<TILE_SZ>),
         nblocks1, nthreads_per_block,
         shmem, res.get_stream(),
-        E, A, B,
+        E, cA, cB,
         ni, nj, nk );
 
       // Kernel 2 (tiled): F = C * D
@@ -310,11 +313,14 @@ void POLYBENCH_3MM::runHipVariantImpl(VariantID vid)
                     static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(nj, TILE_SZ)),
                     static_cast<size_t>(1));
 
+      const Real_type* cC = C;
+      const Real_type* cD = D;
+
       RPlaunchHipKernel(
         (poly_3mm_2_tiled<TILE_SZ>),
         nblocks2, nthreads_per_block,
         shmem, res.get_stream(),
-        F, C, D,
+        F, cC, cD,
         nj, nl, nm );
 
       // Kernel 3 (tiled): G = E * F
@@ -322,11 +328,14 @@ void POLYBENCH_3MM::runHipVariantImpl(VariantID vid)
                     static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, TILE_SZ)),
                     static_cast<size_t>(1));
 
+      const Real_type* cE = E;
+      const Real_type* cF = F;
+
       RPlaunchHipKernel(
         (poly_3mm_3_tiled<TILE_SZ>),
         nblocks3, nthreads_per_block,
         shmem, res.get_stream(),
-        G, E, F,
+        G, cE, cF,
         ni, nl, nj );
 
     }

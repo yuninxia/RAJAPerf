@@ -59,8 +59,8 @@ __global__ void fir(Real_ptr out, Real_ptr in,
 // reads from fast shared memory instead.
 template < size_t block_size >
 __launch_bounds__(block_size)
-__global__ void fir_opt(Real_ptr __restrict__ out,
-                        Real_ptr __restrict__ in,
+__global__ void fir_opt(Real_type* __restrict__ out,
+                        const Real_type* __restrict__ in,
                         const Index_type coefflen,
                         Index_type iend)
 {
@@ -118,9 +118,9 @@ __global__ void fir(Real_ptr out, Real_ptr in,
 // Optimized kernel: shared memory tiling (non-constant-memory variant)
 template < size_t block_size >
 __launch_bounds__(block_size)
-__global__ void fir_opt(Real_ptr __restrict__ out,
-                        Real_ptr __restrict__ in,
-                        Real_ptr __restrict__ coeff,
+__global__ void fir_opt(Real_type* __restrict__ out,
+                        const Real_type* __restrict__ in,
+                        const Real_type* __restrict__ coeff,
                         const Index_type coefflen,
                         Index_type iend)
 {
@@ -178,18 +178,23 @@ void FIR::runHipVariantImpl(VariantID vid)
       constexpr size_t shmem = 0;
 
 #if defined(USE_HIP_CONSTANT_MEMORY)
+      const Real_type* cin = in;
+
       RPlaunchHipKernel( (fir_opt<block_size>),
                          grid_size, block_size,
                          shmem, res.get_stream(),
-                         out, in,
+                         out, cin,
                          coefflen,
                          iend );
 #else
+      const Real_type* cin = in;
+      const Real_type* ccoeff = coeff;
+
       RPlaunchHipKernel( (fir_opt<block_size>),
                          grid_size, block_size,
                          shmem, res.get_stream(),
-                         out, in,
-                         coeff,
+                         out, cin,
+                         ccoeff,
                          coefflen,
                          iend );
 #endif

@@ -35,9 +35,11 @@ namespace apps {
 //
 template < size_t block_size >
   __launch_bounds__(block_size, 8)
-__global__ void Diffusion3DPA(const Real_ptr Basis,
-                              const Real_ptr dBasis, const Real_ptr D,
-                              const Real_ptr X, Real_ptr Y, bool symmetric) {
+__global__ void Diffusion3DPA(const Real_type* __restrict__ Basis,
+                              const Real_type* __restrict__ dBasis,
+                              const Real_type* __restrict__ D,
+                              const Real_type* __restrict__ X,
+                              Real_type* __restrict__ Y, bool symmetric) {
 
   const Index_type e = blockIdx.x;
 
@@ -242,10 +244,15 @@ void DIFFUSION3DPA::runHipVariantImpl(VariantID vid) {
       dim3 nthreads_per_block(diff::Q1D, diff::Q1D, diff::Q1D);
       constexpr size_t shmem = 0;
 
+      const Real_type* cBasis = Basis;
+      const Real_type* cdBasis = dBasis;
+      const Real_type* cD = D;
+      const Real_type* cX = X;
+
       RPlaunchHipKernel( (Diffusion3DPA<block_size>),
                          NE, nthreads_per_block,
                          shmem, res.get_stream(),
-                         Basis, dBasis, D, X, Y, symmetric );
+                         cBasis, cdBasis, cD, cX, Y, symmetric );
     }
     stopTimer();
 

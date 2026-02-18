@@ -22,9 +22,9 @@ namespace apps {
 
 template < size_t block_size >
   __launch_bounds__(block_size)
-__global__ void Mass3DEA(Real_ptr __restrict__ B,
-                         Real_ptr __restrict__ D,
-                         Real_ptr __restrict__ M) {
+__global__ void Mass3DEA(const Real_type* __restrict__ B,
+                         const Real_type* __restrict__ D,
+                         Real_type* __restrict__ M) {
 
   const Index_type e = blockIdx.x;
 
@@ -118,10 +118,13 @@ void MASS3DEA::runHipVariantImpl(VariantID vid) {
       dim3 nthreads_per_block(mea::D1D, mea::D1D, mea::D1D);
       constexpr size_t shmem = 0;
 
+      const Real_type* cB = B;
+      const Real_type* cD = D;
+
       RPlaunchHipKernel( (Mass3DEA<block_size>),
                          NE, nthreads_per_block,
                          shmem, res.get_stream(),
-                         B, D, M );
+                         cB, cD, M );
     }
     stopTimer();
 

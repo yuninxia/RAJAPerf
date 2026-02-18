@@ -151,9 +151,12 @@ __global__ void Convection3DPA(const Real_ptr Basis, const Real_ptr tBasis,
 //
 template < size_t block_size >
   __launch_bounds__(block_size, 8)
-__global__ void Convection3DPA_opt(const Real_ptr Basis, const Real_ptr tBasis,
-                                   const Real_ptr dBasis, const Real_ptr D,
-                                   const Real_ptr X, Real_ptr Y) {
+__global__ void Convection3DPA_opt(const Real_type* __restrict__ Basis,
+                                   const Real_type* __restrict__ tBasis,
+                                   const Real_type* __restrict__ dBasis,
+                                   const Real_type* __restrict__ D,
+                                   const Real_type* __restrict__ X,
+                                   Real_type* __restrict__ Y) {
 
   const Index_type e = blockIdx.x;
 
@@ -391,10 +394,16 @@ void CONVECTION3DPA::runHipVariantImpl(VariantID vid) {
       dim3 nthreads_per_block(conv::Q1D, conv::Q1D, conv::Q1D);
       constexpr size_t shmem = 0;
 
+      const Real_type* cBasis = Basis;
+      const Real_type* ctBasis = tBasis;
+      const Real_type* cdBasis = dBasis;
+      const Real_type* cD = D;
+      const Real_type* cX = X;
+
       RPlaunchHipKernel( (Convection3DPA_opt<block_size>),
                          NE, nthreads_per_block,
                          shmem, res.get_stream(),
-                         Basis, tBasis, dBasis, D, X, Y );
+                         cBasis, ctBasis, cdBasis, cD, cX, Y );
     }
     stopTimer();
 

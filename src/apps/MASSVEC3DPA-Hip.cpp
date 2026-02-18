@@ -270,10 +270,10 @@ void MassVec3DPA_DIRECT(const Real_ptr B,
 template <size_t block_size>
 __launch_bounds__(block_size) __global__
 void MassVec3DPA_DIRECT_RESTRICT_UNROLL(
-    Real_ptr __restrict__ B,
-    Real_ptr __restrict__ D,
-    Real_ptr __restrict__ X,
-    Real_ptr __restrict__ Y)
+    const Real_type* __restrict__ B,
+    const Real_type* __restrict__ D,
+    const Real_type* __restrict__ X,
+    Real_type* __restrict__ Y)
 {
 
   const Index_type e = blockIdx.x;
@@ -611,9 +611,13 @@ void MASSVEC3DPA::runHipVariantImpl(VariantID vid)
         dim3 nthreads_per_block(mvpa::Q1D, mvpa::Q1D, mvpa::Q1D);
         constexpr size_t shmem = 0;
 
+        const Real_type* cB = B;
+        const Real_type* cD = D;
+        const Real_type* cX = X;
+
         RPlaunchHipKernel((MassVec3DPA_DIRECT_RESTRICT_UNROLL<block_size>), NE,
-                          nthreads_per_block, shmem, res.get_stream(), B, D,
-                          X, Y);
+                          nthreads_per_block, shmem, res.get_stream(), cB, cD,
+                          cX, Y);
       }
       stopTimer();
     }

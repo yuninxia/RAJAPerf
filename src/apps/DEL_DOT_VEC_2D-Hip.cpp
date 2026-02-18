@@ -54,11 +54,11 @@ template < size_t block_size >
 __launch_bounds__(block_size, 4)
 __global__ void deldotvec2d_opt(
     Real_type* __restrict__ div,
-    Real_type* __restrict__ x,
-    Real_type* __restrict__ y,
-    Real_type* __restrict__ xdot,
-    Real_type* __restrict__ ydot,
-    Index_type* __restrict__ real_zones,
+    const Real_type* __restrict__ x,
+    const Real_type* __restrict__ y,
+    const Real_type* __restrict__ xdot,
+    const Real_type* __restrict__ ydot,
+    const Index_type* __restrict__ real_zones,
     Real_type half, Real_type ptiny,
     Index_type iend, Index_type jp)
 {
@@ -121,13 +121,19 @@ void DEL_DOT_VEC_2D::runHipVariantImpl(VariantID vid)
       const size_t grid_size = RAJA_DIVIDE_CEILING_INT(iend, block_size);
       constexpr size_t shmem = 0;
 
+      const Real_type* cx = x;
+      const Real_type* cy = y;
+      const Real_type* cxdot = xdot;
+      const Real_type* cydot = ydot;
+      const Index_type* czones = real_zones;
+
       RPlaunchHipKernel( (deldotvec2d_opt<block_size>),
                          grid_size, block_size,
                          shmem, res.get_stream(),
                          div,
-                         x, y,
-                         xdot, ydot,
-                         real_zones,
+                         cx, cy,
+                         cxdot, cydot,
+                         czones,
                          half, ptiny,
                          iend, jp );
 

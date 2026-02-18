@@ -71,9 +71,9 @@ __global__ void poly_gemm(Real_ptr C, Real_ptr A, Real_ptr B,
 // shared memory. Alpha is factored out of the inner loop.
 template < int tile >
 __launch_bounds__(tile * tile)
-__global__ void poly_gemm_tiled(Real_ptr __restrict__ C,
-                                Real_ptr __restrict__ A,
-                                Real_ptr __restrict__ B,
+__global__ void poly_gemm_tiled(Real_type* __restrict__ C,
+                                const Real_type* __restrict__ A,
+                                const Real_type* __restrict__ B,
                                 Real_type alpha, Real_type beta,
                                 Index_type ni, Index_type nj, Index_type nk)
 {
@@ -155,11 +155,14 @@ void POLYBENCH_GEMM::runHipVariantImpl(VariantID vid)
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
+      const Real_type* cA = A;
+      const Real_type* cB = B;
+
       RPlaunchHipKernel(
           (poly_gemm_tiled<TILE_SZ>),
           nblocks_tiled, nthreads_per_block_tiled,
           shmem, res.get_stream(),
-          C, A, B,
+          C, cA, cB,
           alpha, beta,
           ni, nj, nk );
 

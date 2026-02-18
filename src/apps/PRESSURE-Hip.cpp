@@ -32,9 +32,9 @@ namespace apps
 template < size_t block_size >
 __launch_bounds__(block_size)
 __global__ void pressure_fused(Real_type* __restrict__ p_new,
-                               Real_type* __restrict__ compression,
-                               Real_type* __restrict__ e_old,
-                               Real_type* __restrict__ vnewc,
+                               const Real_type* __restrict__ compression,
+                               const Real_type* __restrict__ e_old,
+                               const Real_type* __restrict__ vnewc,
                                const Real_type cls,
                                const Real_type p_cut,
                                const Real_type eosvmax,
@@ -84,11 +84,15 @@ void PRESSURE::runHipVariantImpl(VariantID vid)
       const size_t grid_size = RAJA_DIVIDE_CEILING_INT(iend, block_size);
       constexpr size_t shmem = 0;
 
+      const Real_type* ccompression = compression;
+      const Real_type* ce_old = e_old;
+      const Real_type* cvnewc = vnewc;
+
       RPlaunchHipKernel( (pressure_fused<block_size>),
                          grid_size, block_size,
                          shmem, res.get_stream(),
-                         p_new, compression, e_old,
-                         vnewc,
+                         p_new, ccompression, ce_old,
+                         cvnewc,
                          cls, p_cut, eosvmax, pmin,
                          iend );
 

@@ -38,11 +38,11 @@ constexpr size_t MPA_OPT_BLOCK_SIZE = mpa::Q1D * mpa::Q1D * MPA_MDQ;
 
 template < size_t block_size >
   __launch_bounds__(block_size)
-__global__ void Mass3DPA_3DBlock(Real_ptr __restrict__ B,
-                                 Real_ptr __restrict__ Bt,
-                                 Real_ptr __restrict__ D,
-                                 Real_ptr __restrict__ X,
-                                 Real_ptr __restrict__ Y) {
+__global__ void Mass3DPA_3DBlock(const Real_type* __restrict__ B,
+                                 const Real_type* __restrict__ Bt,
+                                 const Real_type* __restrict__ D,
+                                 const Real_type* __restrict__ X,
+                                 Real_type* __restrict__ Y) {
 
   const Index_type e = hipBlockIdx_x;
 
@@ -202,10 +202,15 @@ void MASS3DPA::runHipVariantImpl(VariantID vid) {
       dim3 nthreads_per_block(mpa::Q1D, mpa::Q1D, MPA_MDQ);
       constexpr size_t shmem = 0;
 
+      const Real_type* cB = B;
+      const Real_type* cBt = Bt;
+      const Real_type* cD = D;
+      const Real_type* cX = X;
+
       RPlaunchHipKernel( (Mass3DPA_3DBlock<MPA_OPT_BLOCK_SIZE>),
                          NE, nthreads_per_block,
                          shmem, res.get_stream(),
-                         B, Bt, D, X, Y );
+                         cB, cBt, cD, cX, Y );
 
     }
     stopTimer();

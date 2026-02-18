@@ -74,8 +74,8 @@ template < int tile >
 __launch_bounds__(tile * tile)
 __global__ void poly_2mm_1_tiled(
     Real_type* __restrict__ tmp,
-    Real_type* __restrict__ A,
-    Real_type* __restrict__ B,
+    const Real_type* __restrict__ A,
+    const Real_type* __restrict__ B,
     Real_type alpha,
     Index_type ni, Index_type nj, Index_type nk)
 {
@@ -114,8 +114,8 @@ __global__ void poly_2mm_1_tiled(
 template < int tile >
 __launch_bounds__(tile * tile)
 __global__ void poly_2mm_2_tiled(
-    Real_type* __restrict__ tmp,
-    Real_type* __restrict__ C,
+    const Real_type* __restrict__ tmp,
+    const Real_type* __restrict__ C,
     Real_type* __restrict__ D,
     Real_type beta,
     Index_type ni, Index_type nl, Index_type nj)
@@ -229,19 +229,25 @@ void POLYBENCH_2MM::runHipVariantImpl(VariantID vid)
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
+      const Real_type* cA = A;
+      const Real_type* cB = B;
+
       RPlaunchHipKernel(
         (poly_2mm_1_tiled<TILE>),
         nblocks1, nthreads_per_block_tiled,
         shmem, res.get_stream(),
-        tmp, A, B,
+        tmp, cA, cB,
         alpha,
         ni, nj, nk );
+
+      const Real_type* ctmp = tmp;
+      const Real_type* cC = C;
 
       RPlaunchHipKernel(
         (poly_2mm_2_tiled<TILE>),
         nblocks2, nthreads_per_block_tiled,
         shmem, res.get_stream(),
-        tmp, C, D,
+        ctmp, cC, D,
         beta,
         ni, nl, nj );
 

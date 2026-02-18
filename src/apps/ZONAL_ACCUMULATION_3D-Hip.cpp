@@ -62,7 +62,7 @@ template < size_t block_size >
 __launch_bounds__(block_size)
 __global__ void zonal_accumulation_3d_opt(
     Real_type* __restrict__ vol,
-    Real_type* __restrict__ x,
+    const Real_type* __restrict__ x,
     Index_type jp, Index_type kp,
     Index_type imin, Index_type jmin, Index_type kmin,
     Index_type ni, Index_type nj,
@@ -121,11 +121,13 @@ void ZONAL_ACCUMULATION_3D::runHipVariantImpl(VariantID vid)
       const size_t grid_size = RAJA_DIVIDE_CEILING_INT(iend, block_size);
       constexpr size_t shmem = 0;
 
+      const Real_type* cx = x;
+
       RPlaunchHipKernel( (zonal_accumulation_3d_opt<block_size>),
                          grid_size, block_size,
                          shmem, res.get_stream(),
                          vol,
-                         x,
+                         cx,
                          jp, kp,
                          imin, jmin, kmin,
                          ni, nj,

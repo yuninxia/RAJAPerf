@@ -32,10 +32,10 @@ namespace apps
 // single local accumulation variable, single global store at end.
 template < size_t block_size >
 __launch_bounds__(block_size, 4)
-__global__ void vol3d(Real_ptr __restrict__ vol,
-                      Real_ptr __restrict__ x,
-                      Real_ptr __restrict__ y,
-                      Real_ptr __restrict__ z,
+__global__ void vol3d(Real_type* __restrict__ vol,
+                      const Real_type* __restrict__ x,
+                      const Real_type* __restrict__ y,
+                      const Real_type* __restrict__ z,
                       const Real_type vnormq,
                       const Index_type jp, const Index_type kp,
                       Index_type ibegin, Index_type iend)
@@ -155,11 +155,15 @@ void VOL3D::runHipVariantImpl(VariantID vid)
       const size_t grid_size = RAJA_DIVIDE_CEILING_INT(iend, block_size);
       constexpr size_t shmem = 0;
 
+      const Real_type* cx = x;
+      const Real_type* cy = y;
+      const Real_type* cz = z;
+
       RPlaunchHipKernel( (vol3d<block_size>),
                          grid_size, block_size,
                          shmem, res.get_stream(),
                          vol,
-                         x, y, z,
+                         cx, cy, cz,
                          vnormq,
                          jp, kp,
                          ibegin, iend );

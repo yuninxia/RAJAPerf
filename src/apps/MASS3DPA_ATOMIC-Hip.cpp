@@ -121,10 +121,10 @@ __global__ void Mass3DPA_Atomic(const Real_ptr B,
 template < size_t block_size >
   __launch_bounds__(block_size)
 __global__ void Mass3DPA_Atomic_Opt(
-    Real_type* __restrict__ B,
-    Real_type* __restrict__ D,
-    Real_type* __restrict__ X,
-    Index_type* __restrict__ ElemToDoF,
+    const Real_type* __restrict__ B,
+    const Real_type* __restrict__ D,
+    const Real_type* __restrict__ X,
+    const Index_type* __restrict__ ElemToDoF,
     Real_type* __restrict__ Y) {
 
   const Index_type e = blockIdx.x;
@@ -283,10 +283,15 @@ void MASS3DPA_ATOMIC::runHipVariantImpl(VariantID vid) {
       dim3 nthreads_per_block(mpa_at::Q1D, mpa_at::Q1D, mpa_at::Q1D);
       constexpr size_t shmem = 0;
 
+      const Real_type* cB = B;
+      const Real_type* cD = D;
+      const Real_type* cX = X;
+      const Index_type* cElemToDoF = ElemToDoF;
+
       RPlaunchHipKernel( (Mass3DPA_Atomic_Opt<block_size>),
                          NE, nthreads_per_block,
                          shmem, res.get_stream(),
-                         B, D, X, ElemToDoF, Y );
+                         cB, cD, cX, cElemToDoF, Y );
 
     }
     stopTimer();
