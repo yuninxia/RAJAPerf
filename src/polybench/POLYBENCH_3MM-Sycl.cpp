@@ -28,6 +28,11 @@ namespace polybench
 #define in_wg_sz (32)
 #define out_wg_sz (work_group_size / in_wg_sz)
 
+  //
+  // Tile size for SLM tiled GEMM (Base_SYCL optimization)
+  //
+constexpr Index_type TILE = 16;
+
 
 template < size_t work_group_size >
 void POLYBENCH_3MM::runSyclVariantImpl(VariantID vid)
@@ -43,77 +48,154 @@ void POLYBENCH_3MM::runSyclVariantImpl(VariantID vid)
 
   if ( vid == Base_SYCL ) {
 
+    // SLM tiled GEMM optimization: cooperative tile loads into shared
+    // local memory reduce global memory traffic by ~TILE x per GEMM.
+    // Work-group size: TILE x TILE (16x16 = 256 threads).
+
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
-      sycl::range<3> global_dim1(1,
-                                 out_wg_sz * RAJA_DIVIDE_CEILING_INT(ni, out_wg_sz),
-                                 in_wg_sz * RAJA_DIVIDE_CEILING_INT(nj, in_wg_sz));
+      // Kernel 1 (tiled): E[ni x nj] = A[ni x nk] * B[nk x nj]
+      {
+        sycl::range<3> global_dim1(1,
+                                   TILE * RAJA_DIVIDE_CEILING_INT(ni, TILE),
+                                   TILE * RAJA_DIVIDE_CEILING_INT(nj, TILE));
+        sycl::range<3> wkgroup_dim(1, TILE, TILE);
 
-      sycl::range<3> global_dim2(1,
-                                 out_wg_sz * RAJA_DIVIDE_CEILING_INT(nj, out_wg_sz),
-                                 in_wg_sz * RAJA_DIVIDE_CEILING_INT(nl, in_wg_sz));
+        qu->submit([&] (sycl::handler& h) {
+          sycl::local_accessor<Real_type, 1> s_A(sycl::range<1>(TILE * TILE), h);
+          sycl::local_accessor<Real_type, 1> s_B(sycl::range<1>(TILE * TILE), h);
 
-      sycl::range<3> global_dim3(1,
-                                 out_wg_sz * RAJA_DIVIDE_CEILING_INT(ni, out_wg_sz),
-                                 in_wg_sz * RAJA_DIVIDE_CEILING_INT(nl, in_wg_sz));
+          h.parallel_for(sycl::nd_range<3>( global_dim1, wkgroup_dim),
+                         [=] (sycl::nd_item<3> item) {
 
-      sycl::range<3> wkgroup_dim(1, out_wg_sz, in_wg_sz);
+            Index_type ty = item.get_local_id(1);
+            Index_type tx = item.get_local_id(2);
+            Index_type i = item.get_group(1) * TILE + ty;
+            Index_type j = item.get_group(2) * TILE + tx;
 
-      qu->submit([&] (sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<3>( global_dim1, wkgroup_dim),
-                       [=] (sycl::nd_item<3> item) {
+            Real_type dot = 0.0;
+            Index_type ntiles = (nk + TILE - 1) / TILE;
 
-          Index_type i = item.get_global_id(1);
-          Index_type j = item.get_global_id(2);
+            for (Index_type t = 0; t < ntiles; t++) {
+              Index_type ak = t * TILE + tx;
+              s_A[ty * TILE + tx] = (i < ni && ak < nk)
+                  ? A[ak + i * nk] : 0.0;
 
-          if (i < ni && j < nj) {
-            POLYBENCH_3MM_BODY1;
-            for (Index_type k=0; k < nk; ++k) {
-              POLYBENCH_3MM_BODY2;
+              Index_type bk = t * TILE + ty;
+              s_B[ty * TILE + tx] = (bk < nk && j < nj)
+                  ? B[j + bk * nj] : 0.0;
+
+              item.barrier(sycl::access::fence_space::local_space);
+
+              #pragma unroll
+              for (Index_type kk = 0; kk < TILE; kk++)
+                dot += s_A[ty * TILE + kk] * s_B[kk * TILE + tx];
+
+              item.barrier(sycl::access::fence_space::local_space);
             }
-            POLYBENCH_3MM_BODY3;
-          }
 
+            if (i < ni && j < nj)
+              E[j + i * nj] = dot;
+
+          });
         });
-      });
+      }
 
-      qu->submit([&] (sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<3>( global_dim2, wkgroup_dim),
-                       [=] (sycl::nd_item<3> item) {
+      // Kernel 2 (tiled): F[nj x nl] = C[nj x nm] * D[nm x nl]
+      {
+        sycl::range<3> global_dim2(1,
+                                   TILE * RAJA_DIVIDE_CEILING_INT(nj, TILE),
+                                   TILE * RAJA_DIVIDE_CEILING_INT(nl, TILE));
+        sycl::range<3> wkgroup_dim(1, TILE, TILE);
 
-          Index_type j = item.get_global_id(1);
-          Index_type l = item.get_global_id(2);
+        qu->submit([&] (sycl::handler& h) {
+          sycl::local_accessor<Real_type, 1> s_C(sycl::range<1>(TILE * TILE), h);
+          sycl::local_accessor<Real_type, 1> s_D(sycl::range<1>(TILE * TILE), h);
 
-          if (j < nj && l < nl) {
-            POLYBENCH_3MM_BODY4;
-            for (Index_type m=0; m < nm; ++m) {
-              POLYBENCH_3MM_BODY5;
+          h.parallel_for(sycl::nd_range<3>( global_dim2, wkgroup_dim),
+                         [=] (sycl::nd_item<3> item) {
+
+            Index_type ty = item.get_local_id(1);
+            Index_type tx = item.get_local_id(2);
+            Index_type j = item.get_group(1) * TILE + ty;
+            Index_type l = item.get_group(2) * TILE + tx;
+
+            Real_type dot = 0.0;
+            Index_type ntiles = (nm + TILE - 1) / TILE;
+
+            for (Index_type t = 0; t < ntiles; t++) {
+              Index_type cm = t * TILE + tx;
+              s_C[ty * TILE + tx] = (j < nj && cm < nm)
+                  ? C[cm + j * nm] : 0.0;
+
+              Index_type dm = t * TILE + ty;
+              s_D[ty * TILE + tx] = (dm < nm && l < nl)
+                  ? D[l + dm * nl] : 0.0;
+
+              item.barrier(sycl::access::fence_space::local_space);
+
+              #pragma unroll
+              for (Index_type mm = 0; mm < TILE; mm++)
+                dot += s_C[ty * TILE + mm] * s_D[mm * TILE + tx];
+
+              item.barrier(sycl::access::fence_space::local_space);
             }
-            POLYBENCH_3MM_BODY6;
-          }
 
+            if (j < nj && l < nl)
+              F[l + j * nl] = dot;
+
+          });
         });
-      });
+      }
 
-      qu->submit([&] (sycl::handler& h) {
-        h.parallel_for(sycl::nd_range<3>( global_dim3, wkgroup_dim),
-                       [=] (sycl::nd_item<3> item) {
+      // Kernel 3 (tiled): G[ni x nl] = E[ni x nj] * F[nj x nl]
+      {
+        sycl::range<3> global_dim3(1,
+                                   TILE * RAJA_DIVIDE_CEILING_INT(ni, TILE),
+                                   TILE * RAJA_DIVIDE_CEILING_INT(nl, TILE));
+        sycl::range<3> wkgroup_dim(1, TILE, TILE);
 
-          Index_type i = item.get_global_id(1);
-          Index_type l = item.get_global_id(2);
+        qu->submit([&] (sycl::handler& h) {
+          sycl::local_accessor<Real_type, 1> s_E(sycl::range<1>(TILE * TILE), h);
+          sycl::local_accessor<Real_type, 1> s_F(sycl::range<1>(TILE * TILE), h);
 
-          if (i < ni && l < nl) {
-            POLYBENCH_3MM_BODY7;
-            for (Index_type j=0; j < nj; ++j) {
-              POLYBENCH_3MM_BODY8;
+          h.parallel_for(sycl::nd_range<3>( global_dim3, wkgroup_dim),
+                         [=] (sycl::nd_item<3> item) {
+
+            Index_type ty = item.get_local_id(1);
+            Index_type tx = item.get_local_id(2);
+            Index_type i = item.get_group(1) * TILE + ty;
+            Index_type l = item.get_group(2) * TILE + tx;
+
+            Real_type dot = 0.0;
+            Index_type ntiles = (nj + TILE - 1) / TILE;
+
+            for (Index_type t = 0; t < ntiles; t++) {
+              Index_type ej = t * TILE + tx;
+              s_E[ty * TILE + tx] = (i < ni && ej < nj)
+                  ? E[ej + i * nj] : 0.0;
+
+              Index_type fj = t * TILE + ty;
+              s_F[ty * TILE + tx] = (fj < nj && l < nl)
+                  ? F[l + fj * nl] : 0.0;
+
+              item.barrier(sycl::access::fence_space::local_space);
+
+              #pragma unroll
+              for (Index_type jj = 0; jj < TILE; jj++)
+                dot += s_E[ty * TILE + jj] * s_F[jj * TILE + tx];
+
+              item.barrier(sycl::access::fence_space::local_space);
             }
-            POLYBENCH_3MM_BODY9;
-          }
 
+            if (i < ni && l < nl)
+              G[l + i * nl] = dot;
+
+          });
         });
-      });
+      }
 
     }
     stopTimer();
