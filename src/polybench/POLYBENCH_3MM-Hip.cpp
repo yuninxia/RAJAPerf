@@ -49,7 +49,13 @@ namespace polybench
                 static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, out_block_sz)), \
                 static_cast<size_t>(1));
 
+//
+// Tile size for LDS tiling optimization (Base_HIP)
+//
+#define TILE_SZ (16)
 
+
+// Original naive kernels (used by Lambda_HIP via poly_3mm_*_lam pattern)
 template < size_t in_block_size, size_t out_block_size >
 __launch_bounds__(in_block_size*out_block_size)
 __global__ void poly_3mm_1(Real_ptr E, Real_ptr A, Real_ptr B,
@@ -140,6 +146,128 @@ __global__ void poly_3mm_3_lam(Index_type ni, Index_type nl,
   }
 }
 
+// SLM tiled GEMM kernels (Base_HIP optimization): cooperative tile loads
+// into shared local memory reduce global memory traffic by ~TILE x per GEMM.
+// Each tile iteration loads TILE x TILE blocks of both input matrices into LDS,
+// then computes TILE partial products per thread from shared memory.
+
+// Kernel 1 (tiled): E[ni x nj] = A[ni x nk] * B[nk x nj]
+template < int tile >
+__launch_bounds__(tile * tile)
+__global__ void poly_3mm_1_tiled(Real_ptr __restrict__ E,
+                                 Real_ptr __restrict__ A,
+                                 Real_ptr __restrict__ B,
+                                 Index_type ni, Index_type nj, Index_type nk)
+{
+  __shared__ Real_type s_A[tile][tile];
+  __shared__ Real_type s_B[tile][tile];
+
+  Index_type ty = threadIdx.y;
+  Index_type tx = threadIdx.x;
+  Index_type i = blockIdx.y * tile + ty;
+  Index_type j = blockIdx.x * tile + tx;
+
+  Real_type dot = 0.0;
+  Index_type ntiles = (nk + tile - 1) / tile;
+
+  for (Index_type t = 0; t < ntiles; t++) {
+    Index_type ak = t * tile + tx;
+    s_A[ty][tx] = (i < ni && ak < nk) ? A[ak + i * nk] : 0.0;
+
+    Index_type bk = t * tile + ty;
+    s_B[ty][tx] = (bk < nk && j < nj) ? B[j + bk * nj] : 0.0;
+
+    __syncthreads();
+
+    #pragma unroll
+    for (Index_type kk = 0; kk < tile; kk++)
+      dot += s_A[ty][kk] * s_B[kk][tx];
+
+    __syncthreads();
+  }
+
+  if (i < ni && j < nj)
+    E[j + i * nj] = dot;
+}
+
+// Kernel 2 (tiled): F[nj x nl] = C[nj x nm] * D[nm x nl]
+template < int tile >
+__launch_bounds__(tile * tile)
+__global__ void poly_3mm_2_tiled(Real_ptr __restrict__ F,
+                                 Real_ptr __restrict__ C,
+                                 Real_ptr __restrict__ D,
+                                 Index_type nj, Index_type nl, Index_type nm)
+{
+  __shared__ Real_type s_C[tile][tile];
+  __shared__ Real_type s_D[tile][tile];
+
+  Index_type ty = threadIdx.y;
+  Index_type tx = threadIdx.x;
+  Index_type j = blockIdx.y * tile + ty;
+  Index_type l = blockIdx.x * tile + tx;
+
+  Real_type dot = 0.0;
+  Index_type ntiles = (nm + tile - 1) / tile;
+
+  for (Index_type t = 0; t < ntiles; t++) {
+    Index_type cm = t * tile + tx;
+    s_C[ty][tx] = (j < nj && cm < nm) ? C[cm + j * nm] : 0.0;
+
+    Index_type dm = t * tile + ty;
+    s_D[ty][tx] = (dm < nm && l < nl) ? D[l + dm * nl] : 0.0;
+
+    __syncthreads();
+
+    #pragma unroll
+    for (Index_type mm = 0; mm < tile; mm++)
+      dot += s_C[ty][mm] * s_D[mm][tx];
+
+    __syncthreads();
+  }
+
+  if (j < nj && l < nl)
+    F[l + j * nl] = dot;
+}
+
+// Kernel 3 (tiled): G[ni x nl] = E[ni x nj] * F[nj x nl]
+template < int tile >
+__launch_bounds__(tile * tile)
+__global__ void poly_3mm_3_tiled(Real_ptr __restrict__ G,
+                                 Real_ptr __restrict__ E,
+                                 Real_ptr __restrict__ F,
+                                 Index_type ni, Index_type nl, Index_type nj)
+{
+  __shared__ Real_type s_E[tile][tile];
+  __shared__ Real_type s_F[tile][tile];
+
+  Index_type ty = threadIdx.y;
+  Index_type tx = threadIdx.x;
+  Index_type i = blockIdx.y * tile + ty;
+  Index_type l = blockIdx.x * tile + tx;
+
+  Real_type dot = 0.0;
+  Index_type ntiles = (nj + tile - 1) / tile;
+
+  for (Index_type t = 0; t < ntiles; t++) {
+    Index_type ej = t * tile + tx;
+    s_E[ty][tx] = (i < ni && ej < nj) ? E[ej + i * nj] : 0.0;
+
+    Index_type fj = t * tile + ty;
+    s_F[ty][tx] = (fj < nj && l < nl) ? F[l + fj * nl] : 0.0;
+
+    __syncthreads();
+
+    #pragma unroll
+    for (Index_type jj = 0; jj < tile; jj++)
+      dot += s_E[ty][jj] * s_F[jj][tx];
+
+    __syncthreads();
+  }
+
+  if (i < ni && l < nl)
+    G[l + i * nl] = dot;
+}
+
 
 template < size_t block_size >
 void POLYBENCH_3MM::runHipVariantImpl(VariantID vid)
@@ -154,35 +282,48 @@ void POLYBENCH_3MM::runHipVariantImpl(VariantID vid)
 
   if ( vid == Base_HIP ) {
 
+    // SLM tiled GEMM optimization: cooperative tile loads into shared
+    // local memory reduce global memory traffic by ~TILE_SZ x per GEMM.
+    // Work-group size: TILE_SZ x TILE_SZ (16x16 = 256 threads).
+
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
-      POLY_3MM_THREADS_PER_BLOCK_HIP;
+      dim3 nthreads_per_block(TILE_SZ, TILE_SZ, 1);
       constexpr size_t shmem = 0;
 
-      POLY_3MM_1_NBLOCKS_HIP;
+      // Kernel 1 (tiled): E = A * B
+      dim3 nblocks1(static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(nj, TILE_SZ)),
+                    static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, TILE_SZ)),
+                    static_cast<size_t>(1));
 
       RPlaunchHipKernel(
-        (poly_3mm_1<POLY_3MM_THREADS_PER_BLOCK_TEMPLATE_PARAMS_HIP>),
+        (poly_3mm_1_tiled<TILE_SZ>),
         nblocks1, nthreads_per_block,
         shmem, res.get_stream(),
         E, A, B,
         ni, nj, nk );
 
-      POLY_3MM_2_NBLOCKS_HIP;
+      // Kernel 2 (tiled): F = C * D
+      dim3 nblocks2(static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(nl, TILE_SZ)),
+                    static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(nj, TILE_SZ)),
+                    static_cast<size_t>(1));
 
       RPlaunchHipKernel(
-        (poly_3mm_2<POLY_3MM_THREADS_PER_BLOCK_TEMPLATE_PARAMS_HIP>),
+        (poly_3mm_2_tiled<TILE_SZ>),
         nblocks2, nthreads_per_block,
         shmem, res.get_stream(),
         F, C, D,
         nj, nl, nm );
 
-      POLY_3MM_3_NBLOCKS_HIP;
+      // Kernel 3 (tiled): G = E * F
+      dim3 nblocks3(static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(nl, TILE_SZ)),
+                    static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, TILE_SZ)),
+                    static_cast<size_t>(1));
 
       RPlaunchHipKernel(
-        (poly_3mm_3<POLY_3MM_THREADS_PER_BLOCK_TEMPLATE_PARAMS_HIP>),
+        (poly_3mm_3_tiled<TILE_SZ>),
         nblocks3, nthreads_per_block,
         shmem, res.get_stream(),
         G, E, F,
