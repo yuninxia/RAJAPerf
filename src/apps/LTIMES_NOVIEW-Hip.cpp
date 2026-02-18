@@ -58,6 +58,54 @@ __global__ void ltimes_noview(Real_ptr phidat, Real_ptr elldat, Real_ptr psidat,
    }
 }
 
+// Leo optimization: Cache ell matrix in LDS with +1 padding to avoid bank
+// conflicts, use register accumulator for phi, and precompute psi base offset
+// outside d-loop.
+// Root cause: 40.3% stalls from global_load_dwordx2 for ell matrix.
+// ell matrix (num_m x num_d) accessed with stride-num_d between warp threads
+// causes cache line misses per warp per d-iteration.
+template < size_t m_block_size, size_t g_block_size, size_t z_block_size >
+__launch_bounds__(m_block_size*g_block_size*z_block_size)
+__global__ void ltimes_noview_opt(Real_ptr phidat, Real_ptr elldat, Real_ptr psidat,
+                                  Index_type num_d,
+                                  Index_type num_m, Index_type num_g, Index_type num_z)
+{
+   // OPT 1: Cache ell in LDS with +1 padding to avoid bank conflicts
+   // Dynamic shared memory layout: s_ell[num_m][num_d + 1]
+   extern __shared__ Real_type dyn_shmem[];
+   const Index_type ell_pitch = num_d + 1;
+
+   // Cooperative load of ell into LDS
+   const Index_type tid = threadIdx.x
+                        + threadIdx.y * m_block_size
+                        + threadIdx.z * m_block_size * g_block_size;
+   const Index_type block_threads = m_block_size * g_block_size * z_block_size;
+   const Index_type ell_elems = num_m * num_d;
+
+   for (Index_type idx = tid; idx < ell_elems; idx += block_threads) {
+     Index_type mm = idx / num_d;
+     Index_type dd = idx % num_d;
+     dyn_shmem[mm * ell_pitch + dd] = elldat[dd + mm * num_d];
+   }
+   __syncthreads();
+
+   Index_type m = blockIdx.x * m_block_size + threadIdx.x;
+   Index_type g = blockIdx.y * g_block_size + threadIdx.y;
+   Index_type z = blockIdx.z * z_block_size + threadIdx.z;
+
+   if (m < num_m && g < num_g && z < num_z) {
+     // OPT 2: Register accumulator for phi
+     Real_type phi_val = 0.0;
+     // OPT 3: Precompute psi base offset outside d-loop
+     Index_type psi_base = g * num_d + z * num_d * num_g;
+
+     for (Index_type d = 0; d < num_d; ++d) {
+       phi_val += dyn_shmem[m * ell_pitch + d] * psidat[d + psi_base];
+     }
+     phidat[m + g * num_m + z * num_m * num_g] = phi_val;
+   }
+}
+
 template < size_t m_block_size, size_t g_block_size, size_t z_block_size, typename Lambda >
 __launch_bounds__(m_block_size*g_block_size*z_block_size)
 __global__ void ltimes_noview_lam(Index_type num_m, Index_type num_g, Index_type num_z,
@@ -86,16 +134,18 @@ void LTIMES_NOVIEW::runHipVariantImpl(VariantID vid)
 
   if ( vid == Base_HIP ) {
 
+    // Leo optimization: shared memory for ell matrix with +1 padding
+    const size_t shmem = num_m * (num_d + 1) * sizeof(Real_type);
+
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
       LTIMES_NOVIEW_THREADS_PER_BLOCK_HIP;
       LTIMES_NOVIEW_NBLOCKS_HIP;
-      constexpr size_t shmem = 0;
 
       RPlaunchHipKernel(
-        (ltimes_noview<LTIMES_NOVIEW_THREADS_PER_BLOCK_TEMPLATE_PARAMS_HIP>),
+        (ltimes_noview_opt<LTIMES_NOVIEW_THREADS_PER_BLOCK_TEMPLATE_PARAMS_HIP>),
         nblocks, nthreads_per_block,
         shmem, res.get_stream(),
         phidat, elldat, psidat,
