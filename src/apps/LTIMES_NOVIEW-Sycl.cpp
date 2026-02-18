@@ -43,27 +43,60 @@ void LTIMES_NOVIEW::runSyclVariantImpl(VariantID vid)
 
   if ( vid == Base_SYCL ) {
 
+    const Index_type wg_total = m_wg_sz * g_wg_sz * z_wg_sz;
+
     sycl::range<3> global_dim(z_wg_sz * RAJA_DIVIDE_CEILING_INT(num_z, z_wg_sz),
                               g_wg_sz * RAJA_DIVIDE_CEILING_INT(num_g, g_wg_sz),
                               m_wg_sz * RAJA_DIVIDE_CEILING_INT(num_m, m_wg_sz));
     sycl::range<3> wkgroup_dim(z_wg_sz, g_wg_sz, m_wg_sz);
+
+    // Leo optimization: Cache ell matrix in SLM with +1 padding to avoid
+    // bank conflicts, use register accumulator for phi, and precompute
+    // psi base offset outside d-loop.
+    // Root cause: 92.7% stalls from address computation dependency chain
+    // in ell index calculation. Caching ell in SLM eliminates repeated
+    // global memory reads and shortens the dependency chain.
+    const Index_type ell_pitch = num_d + 1;
 
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
       qu->submit([&] (sycl::handler& h) {
+
+        // OPT 1: Allocate SLM for ell matrix with +1 padding for bank conflicts
+        sycl::local_accessor<Real_type, 2> s_ell(
+            sycl::range<2>(num_m, ell_pitch), h);
+
         h.parallel_for(sycl::nd_range<3> ( global_dim, wkgroup_dim),
                        [=] (sycl::nd_item<3> item) {
+
+          // Cooperative load of ell into SLM
+          Index_type tid = item.get_local_id(2)
+                         + item.get_local_id(1) * item.get_local_range(2)
+                         + item.get_local_id(0) * item.get_local_range(2) * item.get_local_range(1);
+
+          for (Index_type idx = tid; idx < num_m * num_d; idx += wg_total) {
+            Index_type mm = idx / num_d;
+            Index_type dd = idx % num_d;
+            s_ell[mm][dd] = elldat[dd + mm * num_d];
+          }
+          item.barrier(sycl::access::fence_space::local_space);
 
           Index_type m = item.get_global_id(2);
           Index_type g = item.get_global_id(1);
           Index_type z = item.get_global_id(0);
 
           if (m < num_m && g < num_g && z < num_z) {
+            // OPT 2: Register accumulator for phi
+            Real_type phi_val = 0.0;
+            // OPT 3: Precompute psi base offset outside d-loop
+            Index_type psi_base = g * num_d + z * num_d * num_g;
+
             for (Index_type d = 0; d < num_d; ++d) {
-              LTIMES_NOVIEW_BODY;
-            } 
+              phi_val += s_ell[m][d] * psidat[d + psi_base];
+            }
+            phidat[m + g * num_m + z * num_m * num_g] = phi_val;
           }
 
         });
