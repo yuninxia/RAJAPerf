@@ -63,6 +63,94 @@ __global__ void poly_2mm_1(Real_ptr tmp, Real_ptr A, Real_ptr B,
   }
 }
 
+// SLM tiling optimization: cooperative tile loads reduce global memory
+// traffic by ~TILE x per GEMM.  Each tile iteration loads TILE x TILE
+// blocks of both input matrices into shared local memory, synchronises,
+// then computes TILE FMAs per thread from SLM.
+constexpr Index_type TILE = 16;
+
+// Kernel 1 (tiled): tmp[ni x nj] = alpha * A[ni x nk] * B[nk x nj]
+template < int tile >
+__launch_bounds__(tile * tile)
+__global__ void poly_2mm_1_tiled(
+    Real_type* __restrict__ tmp,
+    const Real_type* __restrict__ A,
+    const Real_type* __restrict__ B,
+    Real_type alpha,
+    Index_type ni, Index_type nj, Index_type nk)
+{
+  __shared__ Real_type s_A[tile][tile];
+  __shared__ Real_type s_B[tile][tile];
+
+  int ty  = threadIdx.y;
+  int tx  = threadIdx.x;
+  int row = blockIdx.y * tile + ty;  // i
+  int col = blockIdx.x * tile + tx;  // j
+
+  Real_type dot = 0.0;
+  int ntiles = (nk + tile - 1) / tile;
+
+  for (int t = 0; t < ntiles; t++) {
+    int ak = t * tile + tx;
+    s_A[ty][tx] = (row < ni && ak < nk) ? A[ak + row * nk] : 0.0;
+
+    int bk = t * tile + ty;
+    s_B[ty][tx] = (bk < nk && col < nj) ? B[col + bk * nj] : 0.0;
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int kk = 0; kk < tile; kk++)
+      dot += s_A[ty][kk] * s_B[kk][tx];
+
+    __syncthreads();
+  }
+
+  if (row < ni && col < nj)
+    tmp[col + row * nj] = alpha * dot;
+}
+
+// Kernel 2 (tiled): D[ni x nl] = beta + tmp[ni x nj] * C[nj x nl]
+template < int tile >
+__launch_bounds__(tile * tile)
+__global__ void poly_2mm_2_tiled(
+    const Real_type* __restrict__ tmp,
+    const Real_type* __restrict__ C,
+    Real_type* __restrict__ D,
+    Real_type beta,
+    Index_type ni, Index_type nl, Index_type nj)
+{
+  __shared__ Real_type s_tmp[tile][tile];
+  __shared__ Real_type s_C[tile][tile];
+
+  int ty  = threadIdx.y;
+  int tx  = threadIdx.x;
+  int row = blockIdx.y * tile + ty;  // i
+  int col = blockIdx.x * tile + tx;  // l
+
+  Real_type dot = 0.0;
+  int ntiles = (nj + tile - 1) / tile;
+
+  for (int t = 0; t < ntiles; t++) {
+    int tj = t * tile + tx;
+    s_tmp[ty][tx] = (row < ni && tj < nj) ? tmp[tj + row * nj] : 0.0;
+
+    int cj = t * tile + ty;
+    s_C[ty][tx] = (cj < nj && col < nl) ? C[col + cj * nl] : 0.0;
+
+    __syncthreads();
+
+    #pragma unroll
+    for (int jj = 0; jj < tile; jj++)
+      dot += s_tmp[ty][jj] * s_C[jj][tx];
+
+    __syncthreads();
+  }
+
+  if (row < ni && col < nl)
+    D[col + row * nl] = beta + dot;
+}
+
 template < size_t in_block_size, size_t out_block_size, typename Lambda >
 __launch_bounds__(in_block_size*out_block_size)
 __global__ void poly_2mm_1_lam(Index_type ni, Index_type nj,
@@ -121,30 +209,45 @@ void POLYBENCH_2MM::runCudaVariantImpl(VariantID vid)
 
   if ( vid == Base_CUDA ) {
 
+    // SLM tiling optimization: cooperative tile loads reduce global memory
+    // traffic by ~TILE x per GEMM.  Each tile iteration loads TILE x TILE
+    // blocks of both input matrices into shared local memory, synchronises,
+    // then computes TILE FMAs per thread from SLM.
+
+    dim3 nthreads_per_block_tiled(TILE, TILE, 1);
+    constexpr size_t shmem = 0;
+
+    dim3 nblocks1(static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(nj, TILE)),
+                  static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, TILE)),
+                  static_cast<size_t>(1));
+
+    dim3 nblocks2(static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(nl, TILE)),
+                  static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, TILE)),
+                  static_cast<size_t>(1));
+
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
-      POLY_2MM_THREADS_PER_BLOCK_CUDA;
-      constexpr size_t shmem = 0;
+      const Real_type* cA = A;
+      const Real_type* cB = B;
 
-      POLY_2MM_1_NBLOCKS_CUDA;
-      
       RPlaunchCudaKernel(
-        (poly_2mm_1<POLY_2MM_THREADS_PER_BLOCK_TEMPLATE_PARAMS_CUDA>),
-        nblocks1, nthreads_per_block,
+        (poly_2mm_1_tiled<TILE>),
+        nblocks1, nthreads_per_block_tiled,
         shmem, res.get_stream(),
-        tmp, A, B,
+        tmp, cA, cB,
         alpha,
         ni, nj, nk );
 
-      POLY_2MM_2_NBLOCKS_CUDA;
+      const Real_type* ctmp = tmp;
+      const Real_type* cC = C;
 
       RPlaunchCudaKernel(
-        (poly_2mm_2<POLY_2MM_THREADS_PER_BLOCK_TEMPLATE_PARAMS_CUDA>),
-        nblocks2, nthreads_per_block,
+        (poly_2mm_2_tiled<TILE>),
+        nblocks2, nthreads_per_block_tiled,
         shmem, res.get_stream(),
-        tmp, C, D,
+        ctmp, cC, D,
         beta,
         ni, nl, nj );
 

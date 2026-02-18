@@ -22,7 +22,9 @@ namespace apps {
 
 template < size_t block_size >
   __launch_bounds__(block_size)
-__global__ void Mass3DEA(const Real_ptr B, const Real_ptr D, Real_ptr M) {
+__global__ void Mass3DEA(const Real_type* __restrict__ B,
+                         const Real_type* __restrict__ D,
+                         Real_type* __restrict__ M) {
 
   const Index_type e = blockIdx.x;
 
@@ -48,10 +50,47 @@ __global__ void Mass3DEA(const Real_ptr B, const Real_ptr D, Real_ptr M) {
 
   __syncthreads();
 
+  // Leo optimization: precompute per-thread basis values in registers
+  // and reorder loops with j3 innermost for batched accumulation.
+  // Original: 7-way multiply with repeated LDS reads per iteration.
+  // Optimized: precompute Bi1/Bi2/Bi3, batch D1D=4 j3 outputs per s_D read.
   GPU_FOREACH_THREAD(i1, x, mea::D1D) {
     GPU_FOREACH_THREAD(i2, y, mea::D1D) {
       GPU_FOREACH_THREAD(i3, z, mea::D1D) {
-        MASS3DEA_4
+
+        // OPT 1: Precompute per-thread basis values (i-dependent, fixed per thread)
+        Real_type Bi1[mea::Q1D], Bi2[mea::Q1D], Bi3[mea::Q1D];
+        for (Index_type k = 0; k < mea::Q1D; k++) {
+          Bi1[k] = s_B[k][i1];
+          Bi2[k] = s_B[k][i2];
+          Bi3[k] = s_B[k][i3];
+        }
+
+        // OPT 2: Loop reorder -- j3 innermost, batch D1D=4 outputs per s_D read
+        for (Index_type j1 = 0; j1 < mea::D1D; ++j1) {
+          for (Index_type j2 = 0; j2 < mea::D1D; ++j2) {
+            Real_type val[mea::D1D] = {};
+
+            for (Index_type k1 = 0; k1 < mea::Q1D; ++k1) {
+              Real_type t1 = Bi1[k1] * s_B[k1][j1];
+              for (Index_type k2 = 0; k2 < mea::Q1D; ++k2) {
+                Real_type t2 = t1 * Bi2[k2] * s_B[k2][j2];
+                for (Index_type k3 = 0; k3 < mea::Q1D; ++k3) {
+                  Real_type t3 = t2 * s_D[k1][k2][k3];
+                  Real_type bik3 = Bi3[k3];
+                  val[0] += t3 * bik3 * s_B[k3][0];
+                  val[1] += t3 * bik3 * s_B[k3][1];
+                  val[2] += t3 * bik3 * s_B[k3][2];
+                  val[3] += t3 * bik3 * s_B[k3][3];
+                }
+              }
+            }
+
+            for (Index_type j3 = 0; j3 < mea::D1D; ++j3)
+              MEA_M(i1, i2, i3, j1, j2, j3, e) = val[j3];
+          }
+        }
+
       }
     }
   }
@@ -79,10 +118,13 @@ void MASS3DEA::runCudaVariantImpl(VariantID vid) {
       dim3 nthreads_per_block(mea::D1D, mea::D1D, mea::D1D);
       constexpr size_t shmem = 0;
 
+      const Real_type* cB = B;
+      const Real_type* cD = D;
+
       RPlaunchCudaKernel( (Mass3DEA<block_size>),
                           NE, nthreads_per_block,
                           shmem, res.get_stream(),
-                          B, D, M );
+                          cB, cD, M );
     }
     stopTimer();
 

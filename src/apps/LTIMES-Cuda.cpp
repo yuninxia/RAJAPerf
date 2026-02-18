@@ -44,6 +44,60 @@ using namespace ltimes_idx;
                static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(*num_z, z_block_sz)));
 
 
+// Leo optimization: cache ell matrix in LDS with +1 padding to avoid
+// bank conflicts, use register accumulator for phi, precompute psi
+// base offset outside d-loop.
+// Root cause (NVIDIA H100): global memory loads for ell matrix.
+// ell matrix (25x64) accessed with stride-64 between warp threads
+// causes cache line misses per warp per d-iteration.
+//
+// OPT 1: __restrict__ on all pointers
+// OPT 2: Cache ell matrix in shared memory with +1 padding
+//         to avoid bank conflicts (stride-64 maps all m-threads
+//         to same bank without padding)
+// OPT 3: Precompute psi base offset outside d-loop
+
+template < size_t m_block_size, size_t g_block_size, size_t z_block_size >
+__launch_bounds__(m_block_size*g_block_size*z_block_size)
+__global__ void ltimes_opt(Real_type* __restrict__ phidat,
+                           const Real_type* __restrict__ elldat,
+                           const Real_type* __restrict__ psidat,
+                           Index_type num_d, Index_type num_m,
+                           Index_type num_g, Index_type num_z)
+{
+   // OPT 2: Shared memory for ell with +1 padding to avoid bank conflicts
+   constexpr Index_type ELL_PITCH = 64 + 1;  // num_d default + 1
+   __shared__ Real_type s_ell[25][ELL_PITCH];  // num_m default x (num_d+1)
+
+   // Cooperative load of ell into LDS
+   Index_type tid = threadIdx.x
+                  + threadIdx.y * m_block_size
+                  + threadIdx.z * m_block_size * g_block_size;
+   constexpr Index_type wg_total = m_block_size * g_block_size * z_block_size;
+
+   for (Index_type idx = tid; idx < num_m * num_d; idx += wg_total) {
+     Index_type mm = idx / num_d;
+     Index_type dd = idx % num_d;
+     s_ell[mm][dd] = elldat[dd + mm * num_d];
+   }
+   __syncthreads();
+
+   Index_type m = blockIdx.x * m_block_size + threadIdx.x;
+   Index_type g = blockIdx.y * g_block_size + threadIdx.y;
+   Index_type z = blockIdx.z * z_block_size + threadIdx.z;
+
+   if (m < num_m && g < num_g && z < num_z) {
+     // OPT 3: Register accumulator + precomputed psi base offset
+     Real_type phi_val = 0.0;
+     Index_type psi_base = g * num_d + z * num_d * num_g;
+
+     for (Index_type d = 0; d < num_d; ++d) {
+       phi_val += s_ell[m][d] * psidat[d + psi_base];
+     }
+     phidat[m + g * num_m + z * num_m * num_g] = phi_val;
+   }
+}
+
 template < size_t m_block_size, size_t g_block_size, size_t z_block_size >
 __launch_bounds__(m_block_size*g_block_size*z_block_size)
 __global__ void ltimes(PHI_VIEW phi, ELL_VIEW ell, PSI_VIEW psi,
@@ -88,20 +142,35 @@ void LTIMES::runCudaVariantImpl(VariantID vid)
 
   if ( vid == Base_CUDA ) {
 
+    // Extract raw pointers for optimized kernel (bypassing RAJA views)
+    Real_ptr phidat = m_phidat;
+    Real_ptr elldat = m_elldat;
+    Real_ptr psidat = m_psidat;
+
+    const Index_type num_d_raw = m_num_d;
+    const Index_type num_g_raw = m_num_g;
+    const Index_type num_m_raw = m_num_m;
+    const Index_type num_z_raw = m_num_z;
+
+    // Shared memory size: num_m * (num_d + 1) * sizeof(Real_type)
+    constexpr size_t shmem = 25 * (64 + 1) * sizeof(Real_type);
+
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
       LTIMES_THREADS_PER_BLOCK_CUDA;
       LTIMES_NBLOCKS_CUDA;
-      constexpr size_t shmem = 0;
+
+      const Real_type* celldat = elldat;
+      const Real_type* cpsidat = psidat;
 
       RPlaunchCudaKernel(
-        (ltimes<LTIMES_THREADS_PER_BLOCK_TEMPLATE_PARAMS_CUDA>),
+        (ltimes_opt<LTIMES_THREADS_PER_BLOCK_TEMPLATE_PARAMS_CUDA>),
         nblocks, nthreads_per_block,
         shmem, res.get_stream(),
-        phi, ell, psi,
-        num_d, num_m, num_g, num_z );
+        phidat, celldat, cpsidat,
+        num_d_raw, num_m_raw, num_g_raw, num_z_raw );
 
     }
     stopTimer();
