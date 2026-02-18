@@ -39,7 +39,13 @@ namespace polybench
                static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, i_block_sz)), \
                static_cast<size_t>(1));
 
+//
+// Tile size for LDS tiling optimization (Base_HIP)
+//
+#define TILE_SZ (16)
 
+
+// Original naive kernel (used by Lambda_HIP via poly_gemm_lam pattern)
 template < size_t j_block_size, size_t i_block_size >
 __launch_bounds__(j_block_size*i_block_size)
 __global__ void poly_gemm(Real_ptr C, Real_ptr A, Real_ptr B,
@@ -56,6 +62,56 @@ __global__ void poly_gemm(Real_ptr C, Real_ptr A, Real_ptr B,
       POLYBENCH_GEMM_BODY3;
     }
     POLYBENCH_GEMM_BODY4;
+  }
+}
+
+// SLM tiling optimization: cooperative tile loads reduce global memory
+// traffic by ~TILE_SZ x. Each tile iteration loads TILE_SZ x TILE_SZ
+// blocks of A and B into LDS, then computes partial products from
+// shared memory. Alpha is factored out of the inner loop.
+template < int tile >
+__launch_bounds__(tile * tile)
+__global__ void poly_gemm_tiled(Real_ptr __restrict__ C,
+                                Real_ptr __restrict__ A,
+                                Real_ptr __restrict__ B,
+                                Real_type alpha, Real_type beta,
+                                Index_type ni, Index_type nj, Index_type nk)
+{
+  __shared__ Real_type s_A[tile][tile];
+  __shared__ Real_type s_B[tile][tile];
+
+  Index_type ty = threadIdx.y;
+  Index_type tx = threadIdx.x;
+  Index_type i = blockIdx.y * tile + ty;
+  Index_type j = blockIdx.x * tile + tx;
+
+  Real_type dot = 0.0;
+  Index_type ntiles = (nk + tile - 1) / tile;
+
+  for (Index_type t = 0; t < ntiles; t++) {
+    // Cooperative load of A tile: A[i][t*tile + tx]
+    Index_type ak = t * tile + tx;
+    s_A[ty][tx] = (i < ni && ak < nk) ? A[ak + i * nk] : 0.0;
+
+    // Cooperative load of B tile: B[t*tile + ty][j]
+    Index_type bk = t * tile + ty;
+    s_B[ty][tx] = (bk < nk && j < nj) ? B[j + bk * nj] : 0.0;
+
+    __syncthreads();
+
+    // Accumulate partial products from LDS
+    #pragma unroll
+    for (Index_type kk = 0; kk < tile; kk++) {
+      dot += s_A[ty][kk] * s_B[kk][tx];
+    }
+
+    __syncthreads();
+  }
+
+  // Write result: C = alpha * dot
+  // (beta * C is dead code per RAJAPerf semantics, as C is overwritten)
+  if (i < ni && j < nj) {
+    C[j + i * nj] = alpha * dot;
   }
 }
 
@@ -86,17 +142,22 @@ void POLYBENCH_GEMM::runHipVariantImpl(VariantID vid)
 
   if ( vid == Base_HIP ) {
 
+    // SLM tiling optimization: TILE_SZ x TILE_SZ thread blocks cooperatively
+    // load tiles of A and B into LDS, reducing global memory traffic by ~TILE_SZ x.
+
+    dim3 nthreads_per_block_tiled(TILE_SZ, TILE_SZ, 1);
+    dim3 nblocks_tiled(static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(nj, TILE_SZ)),
+                       static_cast<size_t>(RAJA_DIVIDE_CEILING_INT(ni, TILE_SZ)),
+                       static_cast<size_t>(1));
+    constexpr size_t shmem = 0;
+
     startTimer();
     // Loop counter increment uses macro to quiet C++20 compiler warning
     for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
 
-      POLY_GEMM_THREADS_PER_BLOCK_HIP;
-      POLY_GEMM_NBLOCKS_HIP;
-      constexpr size_t shmem = 0;
-
       RPlaunchHipKernel(
-          (poly_gemm<POLY_GEMM_THREADS_PER_BLOCK_TEMPLATE_PARAMS_HIP>),
-          nblocks, nthreads_per_block,
+          (poly_gemm_tiled<TILE_SZ>),
+          nblocks_tiled, nthreads_per_block_tiled,
           shmem, res.get_stream(),
           C, A, B,
           alpha, beta,
