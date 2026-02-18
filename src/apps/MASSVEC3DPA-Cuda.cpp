@@ -251,117 +251,6 @@ void MassVec3DPA_DIRECT(const Real_ptr B,
   } // (c) dimension loop
 }
 
-//
-// Optimized kernel: __restrict__ + direct thread mapping + #pragma unroll
-//
-// Root cause (Leo analysis): 71.6% stall ratio, 20% occupancy (57 VGPRs,
-// LDS=1216B). Global_load and barrier stalls from shared memory operations.
-// Achieved speedup: 1.23x on NVIDIA H100.
-//
-// OPT 1: __restrict__ on all pointer parameters -- avoids conservative
-//        pointer aliasing assumptions, improving load/store scheduling.
-// OPT 2: #pragma unroll on all inner reduction loops -- fully unrolls the
-//        short (3-4 iteration) contraction loops for better scheduling.
-// OPT 3: Direct thread mapping (if-based) instead of loop-based mapping --
-//        eliminates loop control overhead (init/compare/increment) since
-//        blockDim = (Q1D,Q1D,Q1D) = (4,4,4) and all ranges are D1D=3 or
-//        Q1D=4, so each thread executes at most one iteration.
-//
-template <size_t block_size>
-__launch_bounds__(block_size) __global__
-void MassVec3DPA_DIRECT_RESTRICT_UNROLL(
-    const Real_type* __restrict__ B,
-    const Real_type* __restrict__ D,
-    const Real_type* __restrict__ X,
-    Real_type* __restrict__ Y)
-{
-
-  const Index_type e = blockIdx.x;
-
-  MASSVEC3DPA_0_GPU;
-
-  // MASSVEC3DPA_1: Load B -> smB and smBt (direct mapping)
-  GPU_SHARED_DIRECT_2D(q, d, mvpa::Q1D, mvpa::D1D) {
-    MASSVEC3DPA_1;
-  }
-
-  for (Index_type c = 0; c < 3; ++c) {
-
-    // MASSVEC3DPA_2: Load X -> smX
-    GPU_SHARED_DIRECT_3D(dx, dy, dz, mvpa::D1D, mvpa::D1D, mvpa::D1D) {
-      MASSVEC3DPA_2;
-    }
-    __syncthreads();
-
-    // MASSVEC3DPA_3: Forward x-contraction: smX -> DDQ
-    GPU_SHARED_DIRECT_3D(qx, dy, dz, mvpa::Q1D, mvpa::D1D, mvpa::D1D) {
-      Real_type u = 0.0;
-      #pragma unroll
-      for (Index_type dx = 0; dx < mvpa::D1D; ++dx) {
-        u += smX[dz][dy][dx] * smB[qx][dx];
-      }
-      DDQ[dz][dy][qx] = u;
-    }
-    __syncthreads();
-
-    // MASSVEC3DPA_4: Forward y-contraction: DDQ -> DQQ
-    GPU_SHARED_DIRECT_3D(qx, qy, dz, mvpa::Q1D, mvpa::Q1D, mvpa::D1D) {
-      Real_type u = 0.0;
-      #pragma unroll
-      for (Index_type dy = 0; dy < mvpa::D1D; ++dy) {
-        u += DDQ[dz][dy][qx] * smB[qy][dy];
-      }
-      DQQ[dz][qy][qx] = u;
-    }
-    __syncthreads();
-
-    // MASSVEC3DPA_5: Forward z-contraction + D multiply: DQQ -> QQQ
-    GPU_SHARED_DIRECT_3D(qx, qy, qz, mvpa::Q1D, mvpa::Q1D, mvpa::Q1D) {
-      Real_type u = 0.0;
-      #pragma unroll
-      for (Index_type dz = 0; dz < mvpa::D1D; ++dz) {
-        u += DQQ[dz][qy][qx] * smB[qz][dz];
-      }
-      QQQ[qz][qy][qx] = u * MVPA_D(qx, qy, qz, e);
-    }
-    __syncthreads();
-
-    // MASSVEC3DPA_6: Backward x-contraction: QQQ -> QQD
-    GPU_SHARED_DIRECT_3D(dx, qy, qz, mvpa::D1D, mvpa::Q1D, mvpa::Q1D) {
-      Real_type u = 0.0;
-      #pragma unroll
-      for (Index_type qx = 0; qx < mvpa::Q1D; ++qx) {
-        u += QQQ[qz][qy][qx] * smBt[dx][qx];
-      }
-      QQD[qz][qy][dx] = u;
-    }
-    __syncthreads();
-
-    // MASSVEC3DPA_7: Backward y-contraction: QQD -> QDD
-    GPU_SHARED_DIRECT_3D(dx, dy, qz, mvpa::D1D, mvpa::D1D, mvpa::Q1D) {
-      Real_type u = 0.0;
-      #pragma unroll
-      for (Index_type qy = 0; qy < mvpa::Q1D; ++qy) {
-        u += QQD[qz][qy][dx] * smBt[dy][qy];
-      }
-      QDD[qz][dy][dx] = u;
-    }
-    __syncthreads();
-
-    // MASSVEC3DPA_8: Backward z-contraction + store Y
-    GPU_SHARED_DIRECT_3D(dx, dy, dz, mvpa::D1D, mvpa::D1D, mvpa::D1D) {
-      Real_type u = 0.0;
-      #pragma unroll
-      for (Index_type qz = 0; qz < mvpa::Q1D; ++qz) {
-        u += QDD[qz][dy][dx] * smBt[dz][qz];
-      }
-      MVPA_Y(dx, dy, dz, c, e) = u;
-    }
-    __syncthreads();
-
-  } // (c) dimension loop
-}
-
 template<typename inner_x, typename inner_y, typename inner_z, typename RESOURCE>
 void MASSVEC3DPA::runRAJAImpl(RESOURCE &res)
 {
@@ -601,25 +490,6 @@ void MASSVEC3DPA::runCudaVariantImpl(VariantID vid)
                           X, Y);
       }
       stopTimer();
-
-    } else if constexpr (tune_idx == 4) {
-
-      startTimer();
-      // Loop counter increment uses macro to quiet C++20 compiler warning
-      for (RepIndex_type irep = 0; irep < run_reps; RP_REPCOUNTINC(irep)) {
-
-        dim3 nthreads_per_block(mvpa::Q1D, mvpa::Q1D, mvpa::Q1D);
-        constexpr size_t shmem = 0;
-
-        const Real_type* cB = B;
-        const Real_type* cD = D;
-        const Real_type* cX = X;
-
-        RPlaunchCudaKernel((MassVec3DPA_DIRECT_RESTRICT_UNROLL<block_size>), NE,
-                          nthreads_per_block, shmem, res.get_stream(), cB, cD,
-                          cX, Y);
-      }
-      stopTimer();
     }
 
     break;
@@ -720,9 +590,6 @@ void MASSVEC3DPA::defineCudaVariantTunings()
 
           addVariantTuning<&MASSVEC3DPA::runCudaVariantImpl<block_size, 3>>(
               vid, "DIRECT_"+std::to_string(block_size));
-
-          addVariantTuning<&MASSVEC3DPA::runCudaVariantImpl<block_size, 4>>(
-              vid, "DIRECT_RESTRICT_UNROLL_"+std::to_string(block_size));
 
         }
 
