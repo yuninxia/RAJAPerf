@@ -1,5 +1,5 @@
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
-// Copyright (c) Lawrence Livermore National Security, LLC and other 
+// Copyright (c) Lawrence Livermore National Security, LLC and other
 // RAJA Project Developers. See top-level LICENSE and COPYRIGHT
 // files for dates and other details. No copyright assignment is required
 // to contribute to RAJA Performance Suite.
@@ -174,4 +174,3 @@ RAJAPERF_GPU_BLOCK_SIZE_TUNING_DEFINE_BOILERPLATE(POLYBENCH_FLOYD_WARSHALL, Hip,
 } // end namespace rajaperf
 
 #endif  // RAJA_ENABLE_HIP
-
