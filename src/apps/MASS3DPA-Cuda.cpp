@@ -1,5 +1,5 @@
 //~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~//
-// Copyright (c) Lawrence Livermore National Security, LLC and other 
+// Copyright (c) Lawrence Livermore National Security, LLC and other
 // RAJA Project Developers. See top-level LICENSE and COPYRIGHT
 // files for dates and other details. No copyright assignment is required
 // to contribute to RAJA Performance Suite.
@@ -88,6 +88,187 @@ __global__ void Mass3DPA(const Real_ptr B, const Real_ptr Bt,
   }
 }
 
+// Leo-optimized kernel: cache B/Bt in separate shared memory, eliminate Phase 6.
+template < size_t block_size >
+  __launch_bounds__(block_size)
+__global__ void Mass3DPA_opt(const Real_type* __restrict__ B,
+                             const Real_type* __restrict__ Bt,
+                             const Real_type* __restrict__ D,
+                             const Real_type* __restrict__ X,
+                             Real_type* __restrict__ Y) {
+
+  const Index_type e = blockIdx.x;
+
+  constexpr Index_type MQ1 = mpa::Q1D;
+  constexpr Index_type MD1 = mpa::D1D;
+  constexpr Index_type MDQ = (MQ1 > MD1) ? MQ1 : MD1;
+  RAJA_TEAM_SHARED Real_type sm0[MDQ * MDQ * MDQ];
+  RAJA_TEAM_SHARED Real_type sm1[MDQ * MDQ * MDQ];
+  Real_type(*Xsmem)[MD1][MD1]  = (Real_type(*)[MD1][MD1])sm0;
+  Real_type(*DDQ)[MD1][MQ1]    = (Real_type(*)[MD1][MQ1])sm1;
+  Real_type(*DQQ)[MQ1][MQ1]    = (Real_type(*)[MQ1][MQ1])sm0;
+  Real_type(*QQQ)[MQ1][MQ1]    = (Real_type(*)[MQ1][MQ1])sm1;
+  Real_type(*QQD)[MQ1][MD1]    = (Real_type(*)[MQ1][MD1])sm0;
+  Real_type(*QDD)[MD1][MD1]    = (Real_type(*)[MD1][MD1])sm1;
+
+  // [OPT 1] B and Bt in separate shared memory
+  RAJA_TEAM_SHARED Real_type s_B[mpa::Q1D * mpa::D1D];
+  RAJA_TEAM_SHARED Real_type s_Bt[mpa::D1D * mpa::Q1D];
+  {
+    const Index_type tid = threadIdx.x + mpa::Q1D * threadIdx.y;
+    if (tid < mpa::Q1D * mpa::D1D) {
+      s_B[tid]  = B[tid];
+      s_Bt[tid] = Bt[tid];
+    }
+  }
+  GPU_FOREACH_THREAD(dy, y, mpa::D1D) {
+    GPU_FOREACH_THREAD(dx, x, mpa::D1D) {
+      MASS3DPA_1
+    }
+  }
+  __syncthreads();
+
+  // Phase 3: s_B[qx + Q1D * dx] replaces Bsmem[qx][dx]
+  GPU_FOREACH_THREAD(dy, y, mpa::D1D) {
+    GPU_FOREACH_THREAD(qx, x, mpa::Q1D) {
+      Real_type u[mpa::D1D];
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dz = 0; dz < mpa::D1D; dz++) {
+        u[dz] = 0;
+      }
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dx = 0; dx < mpa::D1D; ++dx) {
+        RAJAPERF_UNROLL(MD1)
+        for (Index_type dz = 0; dz < mpa::D1D; ++dz) {
+          u[dz] += Xsmem[dz][dy][dx] * s_B[qx + mpa::Q1D * dx];
+        }
+      }
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dz = 0; dz < mpa::D1D; ++dz) {
+        DDQ[dz][dy][qx] = u[dz];
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase 4: s_B[qy + Q1D * dy] replaces Bsmem[qy][dy]
+  GPU_FOREACH_THREAD(qy, y, mpa::Q1D) {
+    GPU_FOREACH_THREAD(qx, x, mpa::Q1D) {
+      Real_type u[mpa::D1D];
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dz = 0; dz < mpa::D1D; dz++) {
+        u[dz] = 0;
+      }
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dy = 0; dy < mpa::D1D; ++dy) {
+        RAJAPERF_UNROLL(MD1)
+        for (Index_type dz = 0; dz < mpa::D1D; dz++) {
+          u[dz] += DDQ[dz][dy][qx] * s_B[qy + mpa::Q1D * dy];
+        }
+      }
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dz = 0; dz < mpa::D1D; dz++) {
+        DQQ[dz][qy][qx] = u[dz];
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase 5: s_B[qz + Q1D * dz] replaces Bsmem[qz][dz]
+  GPU_FOREACH_THREAD(qy, y, mpa::Q1D) {
+    GPU_FOREACH_THREAD(qx, x, mpa::Q1D) {
+      Real_type u[mpa::Q1D];
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qz = 0; qz < mpa::Q1D; qz++) {
+        u[qz] = 0;
+      }
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dz = 0; dz < mpa::D1D; ++dz) {
+        RAJAPERF_UNROLL(MQ1)
+        for (Index_type qz = 0; qz < mpa::Q1D; qz++) {
+          u[qz] += DQQ[dz][qy][qx] * s_B[qz + mpa::Q1D * dz];
+        }
+      }
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qz = 0; qz < mpa::Q1D; qz++) {
+        QQQ[qz][qy][qx] = u[qz] * MPA_D(qx, qy, qz, e);
+      }
+    }
+  }
+
+  // [OPT 3] Phase 6 eliminated; single sync replaces two
+  __syncthreads();
+
+  // Phase 7: s_Bt[qx + D1D * dx] replaces Btsmem[dx][qx]
+  GPU_FOREACH_THREAD(qy, y, mpa::Q1D) {
+    GPU_FOREACH_THREAD(dx, x, mpa::D1D) {
+      Real_type u[mpa::Q1D];
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qz = 0; qz < mpa::Q1D; ++qz) {
+        u[qz] = 0;
+      }
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qx = 0; qx < mpa::Q1D; ++qx) {
+        RAJAPERF_UNROLL(MQ1)
+        for (Index_type qz = 0; qz < mpa::Q1D; ++qz) {
+          u[qz] += QQQ[qz][qy][qx] * s_Bt[qx + mpa::D1D * dx];
+        }
+      }
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qz = 0; qz < mpa::Q1D; ++qz) {
+        QQD[qz][qy][dx] = u[qz];
+      }
+    }
+  }
+  __syncthreads();
+
+  // Phase 8: s_Bt[qy + D1D * dy] replaces Btsmem[dy][qy]
+  GPU_FOREACH_THREAD(dy, y, mpa::D1D) {
+    GPU_FOREACH_THREAD(dx, x, mpa::D1D) {
+      Real_type u[mpa::Q1D];
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qz = 0; qz < mpa::Q1D; ++qz) {
+        u[qz] = 0;
+      }
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qy = 0; qy < mpa::Q1D; ++qy) {
+        RAJAPERF_UNROLL(MQ1)
+        for (Index_type qz = 0; qz < mpa::Q1D; ++qz) {
+          u[qz] += QQD[qz][qy][dx] * s_Bt[qy + mpa::D1D * dy];
+        }
+      }
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qz = 0; qz < mpa::Q1D; ++qz) {
+        QDD[qz][dy][dx] = u[qz];
+      }
+    }
+  }
+
+  __syncthreads();
+
+  // Phase 9: s_Bt[qz + D1D * dz] replaces Btsmem[dz][qz]
+  GPU_FOREACH_THREAD(dy, y, mpa::D1D) {
+    GPU_FOREACH_THREAD(dx, x, mpa::D1D) {
+      Real_type u[mpa::D1D];
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dz = 0; dz < mpa::D1D; ++dz) {
+        u[dz] = 0;
+      }
+      RAJAPERF_UNROLL(MQ1)
+      for (Index_type qz = 0; qz < mpa::Q1D; ++qz) {
+        RAJAPERF_UNROLL(MD1)
+        for (Index_type dz = 0; dz < mpa::D1D; ++dz) {
+          u[dz] += QDD[qz][dy][dx] * s_Bt[qz + mpa::D1D * dz];
+        }
+      }
+      RAJAPERF_UNROLL(MD1)
+      for (Index_type dz = 0; dz < mpa::D1D; ++dz) {
+        MPA_Y(dx, dy, dz, e) += u[dz];
+      }
+    }
+  }
+}
+
 template < size_t block_size >
 void MASS3DPA::runCudaVariantImpl(VariantID vid) {
   setBlockSize(block_size);
@@ -109,10 +290,15 @@ void MASS3DPA::runCudaVariantImpl(VariantID vid) {
       dim3 nthreads_per_block(mpa::Q1D, mpa::Q1D, 1);
       constexpr size_t shmem = 0;
 
-      RPlaunchCudaKernel( (Mass3DPA<block_size>),
+      const Real_type* cB = B;
+      const Real_type* cBt = Bt;
+      const Real_type* cD = D;
+      const Real_type* cX = X;
+
+      RPlaunchCudaKernel( (Mass3DPA_opt<block_size>),
                           NE, nthreads_per_block,
                           shmem, res.get_stream(),
-                          B, Bt, D, X, Y );
+                          cB, cBt, cD, cX, Y );
     }
     stopTimer();
 
